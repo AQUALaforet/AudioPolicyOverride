@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>
+    </queries>
+    <application android:name=".AudioPolicyApplication" android:label="Audio Policy Override" android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@drawable/ic_audio_policy" android:dataExtractionRules="@xml/data_extraction_rules"
+        android:supportsRtl="true" android:theme="@style/AppTheme">
+        <meta-data android:name="moe.shizuku.client.V3_SUPPORT" android:value="true" />
+        <provider android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku" android:exported="true"
+            android:multiprocess="false" android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        <service android:name=".automation.AutomationService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-enabled monitoring of selected foreground apps via Shizuku to temporarily override and restore the device audio policy." />
+        </service>
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
