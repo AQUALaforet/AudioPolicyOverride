@@ -9,6 +9,12 @@ FORCE_NONE = 0
 FORCE_SYSTEM_ENFORCED = 11
 ```
 
+## ダウンロード
+
+[GitHub Releases](https://github.com/AQUALaforet/AudioPolicyOverride/releases/latest) の
+Assets から `AudioPolicyOverride-1.1.1.apk` をダウンロードしてインストールしてください。
+現在の配布 APK はデバッグ署名です。
+
 ## 動作
 
 - 手動 ON: 現在値を取得し、変更前の値を保存して `setForceUse(4, 0)` を実行します。
@@ -162,15 +168,7 @@ Debug APK: `app/build/outputs/apk/debug/app-debug.apk`
 JDK 17 と必要な Android SDK を用意し、単体テスト・lint・Debug / Release ビルドを実行します。
 Gradle Wrapper とアクションの参照は固定し、ビルド結果と検査レポートを30日間保存します。
 
-1. GitHub の **Actions → Android Build** を開きます。
-2. 成功した実行を開き、**Artifacts → AudioPolicyOverride-apks** をダウンロードします。
-3. ZIP 内の `debug/app-debug.apk` がインストール用です。
-
-`release/app-release-unsigned.apk` は未署名です。配布には別途、自分の鍵で署名してください。
-Debug APK は各実行環境のデバッグ鍵で署名されるため、ローカル版や別の実行で作成した APK への
-上書き更新はできない場合があります。継続配布には同じ鍵による Release 署名を使用してください。
-アンインストールが必要な場合は、その前に音声設定を復元してください。
-ワークフローは端末を操作せず、Release の公開も自動では行いません。
+配布 APK は上記の GitHub Releases で公開します。
 
 ## 確認とログ
 
