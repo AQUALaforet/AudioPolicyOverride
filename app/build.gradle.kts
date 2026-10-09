@@ -9,8 +9,8 @@ android {
         applicationId = "dev.aqua.audiopolicy"
         minSdk = 26
         targetSdk = 37
-        versionCode = 4
-        versionName = "1.1.2"
+        versionCode = 6
+        versionName = "1.2.1"
     }
     buildFeatures { compose = true; aidl = true; buildConfig = true }
     testOptions { unitTests.isIncludeAndroidResources = true }

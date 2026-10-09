@@ -9,6 +9,7 @@ import dev.aqua.audiopolicy.data.PolicySnapshot
 class AutomaticPolicy(private val controller: OverrideController) {
     suspend fun reconcile(targetActive: Boolean, canRelease: suspend () -> Boolean = { true }): PolicySnapshot {
         val actual = controller.read()
+        check(!actual.record.restoreRequested) { "明示的な復元要求が未完了です。アプリで確認してください。" }
         check(ForceUse.supported(actual.current)) { "想定外の現在値です。自動切替を停止しています。" }
         check(!actual.record.overrideActive || actual.canRestore) { "復元情報が不正です。自動切替を停止しています。" }
         if (!targetActive) return controller.releaseAutomatic(canRelease)

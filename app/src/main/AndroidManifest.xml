@@ -20,6 +20,13 @@
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="User-enabled monitoring of selected foreground apps via Shizuku to temporarily override and restore the device audio policy." />
         </service>
+        <activity android:name=".RestoreActivity" android:exported="false" android:launchMode="singleTop" />
+        <service android:name=".AudioPolicyTileService" android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:label="Audio Override" android:icon="@drawable/ic_qs_audio">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+            <meta-data android:name="android.service.quicksettings.TOGGLEABLE_TILE" android:value="true" />
+        </service>
         <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

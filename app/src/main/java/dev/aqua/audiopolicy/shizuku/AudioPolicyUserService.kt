@@ -1,6 +1,5 @@
 package dev.aqua.audiopolicy.shizuku
 
-import android.util.Log
 import android.app.ActivityManager
 import android.os.Build
 import dev.aqua.audiopolicy.ForceUse
@@ -36,18 +35,13 @@ class AudioPolicyUserService : IAudioPolicyService.Stub() {
     }
 
     @Synchronized override fun getForceUse(): Int = reflect {
-        (methods.first.invoke(null, ForceUse.FOR_SYSTEM) as Int).also {
-            Log.i(TAG, "getForceUse(4)=$it")
-        }
+        methods.first.invoke(null, ForceUse.FOR_SYSTEM) as Int
     }
 
     @Synchronized override fun setForceUse(config: Int): Int {
         validateConfig(config)
         return reflect {
-            Log.i(TAG, "setForceUse(4, $config)")
-            (methods.second.invoke(null, ForceUse.FOR_SYSTEM, config) as Int).also {
-                Log.i(TAG, "setForceUse return=$it")
-            }
+            methods.second.invoke(null, ForceUse.FOR_SYSTEM, config) as Int
         }
     }
 
@@ -62,16 +56,13 @@ class AudioPolicyUserService : IAudioPolicyService.Stub() {
         block()
     } catch (e: Exception) {
         val cause = if (e is InvocationTargetException) e.targetException else e
-        Log.e(TAG, "UserService reflection failed", cause)
         // IllegalStateException is supported by Parcel.readException across Binder.
         throw IllegalStateException("UserService reflection failed: ${cause.javaClass.simpleName}: ${cause.message}")
     } catch (e: LinkageError) {
-        Log.e(TAG, "AudioSystem linkage failed", e)
         throw IllegalStateException("AudioSystem unavailable: ${e.javaClass.simpleName}")
     }
 
     override fun destroy() {
-        Log.i(TAG, "UserService destroy; persistent restore record remains in app")
         exitProcess(0)
     }
 

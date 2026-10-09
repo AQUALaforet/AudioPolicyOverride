@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import dev.aqua.audiopolicy.AudioPolicyApplication
 import dev.aqua.audiopolicy.MainActivity
+import dev.aqua.audiopolicy.RestoreActivity
 import dev.aqua.audiopolicy.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -50,13 +51,13 @@ class AutomationService : Service() {
     }
     private fun notification(text: String): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        // Stop action opens the visible Activity first; it then performs the restore safely.
-        val stop = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java).setAction(ACTION_STOP),
+        // Private direct Activity destination awaits the shared Engine job.
+        val stop = PendingIntent.getActivity(this, 1, Intent(this, RestoreActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_stat_audio)
             .setContentTitle("Audio Policy Override").setContentText(text).setContentIntent(open)
             .setOngoing(true).setOnlyAlertOnce(true)
-            .addAction(Notification.Action.Builder(null, "自動切替を停止", stop).build()).build()
+            .addAction(Notification.Action.Builder(null, "復元して停止", stop).build()).build()
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
     override fun onBind(intent: Intent?): IBinder? = null
@@ -66,7 +67,6 @@ class AutomationService : Service() {
         super.onDestroy()
     }
     companion object {
-        const val ACTION_STOP = "dev.aqua.audiopolicy.STOP_AUTOMATION"
         private const val CHANNEL = "automatic_audio_policy"
         private const val ID = 10
     }

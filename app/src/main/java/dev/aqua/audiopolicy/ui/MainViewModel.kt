@@ -10,6 +10,10 @@ typealias MainUiState = PolicyUiState
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val engine = (application as AudioPolicyApplication).engine
     val state = engine.state
+    val diagnostics = engine.diagnostics.state
+    fun setDiagnosticRecording(enabled: Boolean) { engine.setDiagnosticRecording(enabled) }
+    fun deleteDiagnosticLogs() { engine.deleteDiagnosticLogs() }
+    suspend fun diagnosticInfo() = engine.diagnosticInfo()
     fun requestPermission() = engine.requestPermission()
     fun reload() = engine.reload()
     fun setEnabled(enabled: Boolean) { engine.setManual(enabled) }

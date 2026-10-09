@@ -12,7 +12,7 @@ FORCE_SYSTEM_ENFORCED = 11
 ## ダウンロード
 
 [GitHub Releases](https://github.com/AQUALaforet/AudioPolicyOverride/releases/latest) の
-Assets から `AudioPolicyOverride-1.1.2.apk` をダウンロードしてインストールしてください。
+Assets から `AudioPolicyOverride-1.2.1.apk` をダウンロードしてインストールしてください。
 現在の配布 APK はデバッグ署名です。
 
 ## 動作
@@ -126,7 +126,7 @@ Binder death / disconnect 時は値と接続を無効化します。15 秒の bi
 手動再接続を備え、権限と Binder 生存状態は各呼び出しでも確認します。
 Binder 操作は IO スレッド、変更操作は排他制御します。
 
-DataStore に `originalForceUse`、`overrideActive`、`changePending`、`overrideOwner` を保存します。
+DataStore に `originalForceUse`、`overrideActive`、`changePending`、`overrideOwner`、`restoreRequested` を保存します。
 所有者は MANUAL または AUTOMATIC です。v1.0 の既存復元記録は MANUAL として引き継ぎます。
 `automationEnabled`、`targetPackages` に自動設定を保存します。
 元の値を永続保存できなければ AudioSystem を変更しません。
@@ -172,9 +172,9 @@ Gradle Wrapper とアクションの参照は固定し、ビルド結果と検�
 
 ## 確認とログ
 
-Logcat タグ: `ShizukuManager`、`AudioPolicyUserService`、`AudioPolicyEngine`。
-Shizuku / UserService 接続、get 結果、set 引数・戻り値、reflection / Binder 例外、復元要求を記録します。
-認証情報などの秘密情報は記録しません。
+診断用 Logcat は、下記「診断ログを記録」がONの場合のみ `AudioPolicyDiagnostics` タグで出力します。
+OFF時に残すアプリ独自の診断Logcatはありません。UserServiceからの常時出力も行いません。
+AndroidやShizukuライブラリ自体の出力は、この設定の制御対象外です。
 
 単体テストは UserService の入力制限、正常な有効化・再起動後の復元、二重 ON、非 0 戻り値、UNKNOWN、
 保存失敗、Binder 応答喪失、保存状態との不一致、読み戻し不一致、不正な復元値、
@@ -188,3 +188,55 @@ ON / OFF と復元、および使用するカメラアプリの音を確認し�
 
 今回のビルド・単体テスト・実機確認の結果は [検証結果](verification/RESULTS.md) にまとめています。
 切断・復元・所有権・並行処理に関する修正は [信頼性レビュー](verification/RELIABILITY_REVIEW.md) を参照してください。
+
+## クイック設定タイル・通知
+
+クイック設定の編集画面から **Audio Override** タイルを追加してください。
+タイルには、手動／自動 Override 有効、無効、接続・状態未確認、操作中／復元待ちを表示します。
+表示中は共有 Engine の更新を購読し、操作時は実際の値と保存記録を再確認します。
+状態未確認は有効確定として表示せず、タップするとアプリでの確認を案内します。
+ロック中は解除を求め、解除後にもう一度状態を確認します。
+
+- タイルのONは手動 Override を要求します。自動 Override 中なら元の値を保持して手動所有へ引き継ぎます。
+- タイルの手動OFFは通常の手動OFFと同じです。対象アプリが前面なら自動所有へ引き継ぎ、自動切替の設定は維持します。
+- 常駐通知の **「復元して停止」** は、手動所有も含めて保存した元の値へ復元し、自動切替と監視を停止します。復元記録がなければ現在値の確認のみ行い、値を書き込みません。
+
+復元失敗・再接続が必要・前回の変更が未確認・不正な復元記録は、専用チャネルの通知を同じIDで更新します。
+タップするとアプリを開きます。復元成功を読み戻しで確認して記録を解消すると通知を消します。
+正常な手動ONや接続切断だけを復元失敗とは判断しません。
+明示的な復元要求は `restoreRequested` に保存し、切断・プロセス再生成後も再接続時に引き継ぎます。
+接続できない間にOS状態を変更することはできません。アプリが再び起動するまで復元できない場合があります。
+
+通知が無効な場合も復元処理を継続し、問題をアプリ内に表示します。
+アプリの「通知を許可する」から説明を確認して権限を許可してください。
+通知チャネルが個別に無効な場合は、Androidのアプリ通知設定で有効にしてください。
+バックグラウンドから権限は要求しません。
+
+タイルのActivity起動はAPI34以上でPendingIntent、API26〜33では従来のIntent APIを使います。
+通知Actionは外部公開しないActivityを直接開き、Application所有の処理完了を待ちます。
+[TileServiceの公式API](https://developer.android.com/reference/android/service/quicksettings/TileService)を参照しています。
+実機でのタイル追加・ロック解除・通知Action・OEMのバックグラウンド制限は別途確認が必要です。
+
+今回の検証結果: [タイル・通知の検証](verification/TILE_NOTIFICATIONS.md)。
+
+## 診断設定
+
+画面下部の「診断設定」で **「診断ログを記録」** をONにすると記録を開始します。
+初期値はOFFです。設定と履歴はアプリ専用領域のファイルに永続化し、復元用DataStoreとは分離しています。
+ONの間だけ、適用・復元・失敗の日時、操作元（UI／タイル／通知／自動切替／復旧）、
+AudioSystemの戻り値、読み戻し結果、Shizuku接続状態の変化を直近100件まで記録します。
+250msごとの監視結果、定期的な現在値の読み取り、前面アプリ名・対象外アプリの移動履歴は記録しません。
+例外は種類のみを記録し、詳細メッセージやアプリ名は保存しません。
+
+OFFにすると新しい履歴と診断Logcatを停止します。既存履歴は残るので、消す場合は **「ログを削除」** を押してください。
+「診断情報をコピー」はOFFでも利用できます。明示的な操作時に端末・OS・接続状態・
+AudioSystemの現在値・復元記録を確認し、保存された履歴がある場合だけ履歴も含めてクリップボードにコピーします。
+取得できない項目は未確認として表示し、復元値を推測しません。ログの外部自動送信はありません。
+
+OFFでも音声設定の変更、復元記録の保存、エラー表示、復元失敗通知は通常どおり動作します。
+診断の保存失敗は診断設定欄に表示し、音声操作の経路を止めません。
+OFFの保存に失敗しても、そのプロセスでは記録を停止します。ただし再起動後は以前の保存設定に戻る可能性があるため、エラー表示時は保存状態を確認してください。
+診断書き込みは音声操作の排他処理から切り離し、診断用の別の排他制御で設定変更・記録・削除を直列化します。
+アプリが急に終了した場合、最後の非同期診断記録が残らないことがあります。音声復元用の記録は従来の方式で別に保存します。
+
+検証結果: [診断機能の検証](verification/DIAGNOSTICS.md)。

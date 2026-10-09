@@ -7,7 +7,6 @@ import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.util.Log
 import dev.aqua.audiopolicy.BuildConfig
 import dev.aqua.audiopolicy.aidl.IAudioPolicyService
 import kotlinx.coroutines.Dispatchers
@@ -79,7 +78,6 @@ class ShizukuManager internal constructor(context: Context, private val access: 
                 service = IAudioPolicyService.Stub.asInterface(binder)
                 handler.removeCallbacks(timeout)
                 handler.removeCallbacks(retry)
-                Log.i(TAG, "UserService connected")
                 mutableState.value = mutableState.value.copy(connecting = false, connected = true,
                     session = mutableState.value.session + 1, error = null)
             } catch (e: Exception) { fail(e) }
@@ -98,13 +96,11 @@ class ShizukuManager internal constructor(context: Context, private val access: 
         if (closed) return@OnBinderReceivedListener
         ready = true
         detach() // A replacement Shizuku Binder invalidates the old UserService session.
-        Log.i(TAG, "Shizuku Binder received")
         refresh()
     }
     private val dead = Shizuku.OnBinderDeadListener {
         if (closed) return@OnBinderDeadListener
         ready = false
-        Log.w(TAG, "Shizuku Binder died")
         disconnected("Shizuku が停止しました。起動後、再読み込みしてください。")
         mutableState.value = mutableState.value.copy(running = false, ready = false, granted = false)
     }
@@ -133,7 +129,6 @@ class ShizukuManager internal constructor(context: Context, private val access: 
             val running = access.ping()
             val compatible = running && ready && access.compatible()
             val granted = compatible && access.granted()
-            Log.i(TAG, "Shizuku status: installed=$installed, running=$running, ready=$ready, granted=$granted")
             mutableState.value = mutableState.value.copy(installed = installed, running = running, ready = running && ready, granted = granted,
                 error = if (running && ready && !compatible) "Shizuku v12 以降が必要です。" else null)
             if (!granted) detach() else if (!bound) bind()
@@ -160,7 +155,6 @@ class ShizukuManager internal constructor(context: Context, private val access: 
         mutableState.value = mutableState.value.copy(connecting = true, connected = false)
         handler.postDelayed(timeout, 15_000)
         try {
-            Log.i(TAG, "Binding UserService")
             access.bind(args, connection)
         } catch (e: Exception) { fail(e) }
     }
@@ -169,7 +163,6 @@ class ShizukuManager internal constructor(context: Context, private val access: 
         if (closed) return
         detach()
         mutableState.value = mutableState.value.copy(connecting = false, connected = false, error = message)
-        Log.w(TAG, message)
         retryLater()
     }
     private fun clearService() {
@@ -187,15 +180,14 @@ class ShizukuManager internal constructor(context: Context, private val access: 
         bound = false
         if (wasBound && connection != null) {
             try { if (access.ping()) access.unbind(args, connection, true) }
-            catch (e: Exception) { Log.w(TAG, "UserService unbind failed", e) }
+            catch (e: Exception) { /* policy state handles the error; diagnostic logs are opt-in */ }
             // remove=true does not clear Shizuku-API's local connection list.
             try { access.unbind(args, connection, false) }
-            catch (e: Exception) { Log.w(TAG, "UserService listener cleanup failed", e) }
+            catch (e: Exception) { /* policy state handles the error; diagnostic logs are opt-in */ }
         }
         mutableState.value = mutableState.value.copy(connecting = false, connected = false)
     }
     private fun fail(e: Exception) {
-        Log.e(TAG, "Shizuku/Binder exception", e)
         disconnected(e.message ?: e.javaClass.simpleName)
         val running = runCatching { access.ping() }.getOrDefault(false)
         val granted = e !is SecurityException && running && ready && runCatching { access.granted() }.getOrDefault(false)
@@ -211,7 +203,6 @@ class ShizukuManager internal constructor(context: Context, private val access: 
             check(remote.asBinder().isBinderAlive) { "UserService Binder が終了しています。" }
             block(remote)
         } catch (e: Exception) {
-            Log.e(TAG, "Binder call failed", e)
             if (generateSequence(e as Throwable) { it.cause }.any { it is android.os.RemoteException } || e is SecurityException ||
                 !runCatching { access.ping() }.getOrDefault(false) || remote?.asBinder()?.isBinderAlive != true) {
                 handler.post { if (service === remote) fail(e) }

@@ -20,9 +20,10 @@ data class RestoreRecord(
     val originalForceUse: Int? = null,
     val overrideActive: Boolean = false,
     val changePending: Boolean = false,
-    val owner: OverrideOwner = OverrideOwner.MANUAL
+    val owner: OverrideOwner = OverrideOwner.MANUAL,
+    val restoreRequested: Boolean = false
 ) {
-    val hasRecovery get() = originalForceUse != null || overrideActive || changePending
+    val hasRecovery get() = originalForceUse != null || overrideActive || changePending || restoreRequested
 }
 
 interface RestoreStore {
@@ -43,7 +44,8 @@ class SettingsRepository(context: Context) : PolicySettingsStore {
     override suspend fun setTargets(packages: Set<String>) { store.edit { it[TARGETS] = packages.toSet() } }
     override suspend fun read(): RestoreRecord = store.data.first().let {
         RestoreRecord(it[ORIGINAL], it[ACTIVE] ?: false, it[PENDING] ?: false,
-            if (it[OWNER] == OverrideOwner.AUTOMATIC.name) OverrideOwner.AUTOMATIC else OverrideOwner.MANUAL)
+            if (it[OWNER] == OverrideOwner.AUTOMATIC.name) OverrideOwner.AUTOMATIC else OverrideOwner.MANUAL,
+            it[RESTORE_REQUESTED] ?: false)
     }
     override suspend fun write(record: RestoreRecord) {
         store.edit {
@@ -51,6 +53,7 @@ class SettingsRepository(context: Context) : PolicySettingsStore {
             it[ACTIVE] = record.overrideActive
             it[PENDING] = record.changePending
             it[OWNER] = record.owner.name
+            it[RESTORE_REQUESTED] = record.restoreRequested
         }
     }
     private companion object {
@@ -58,6 +61,7 @@ class SettingsRepository(context: Context) : PolicySettingsStore {
         val ACTIVE = booleanPreferencesKey("overrideActive")
         val PENDING = booleanPreferencesKey("changePending")
         val OWNER = stringPreferencesKey("overrideOwner")
+        val RESTORE_REQUESTED = booleanPreferencesKey("restoreRequested")
         val AUTO_ENABLED = booleanPreferencesKey("automationEnabled")
         val TARGETS = stringSetPreferencesKey("targetPackages")
     }

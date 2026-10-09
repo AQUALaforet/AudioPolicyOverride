@@ -44,7 +44,9 @@ import dev.aqua.audiopolicy.data.AppChoice
 fun MainScreen(state: MainUiState, onPermission: () -> Unit, onReload: () -> Unit,
                onToggle: (Boolean) -> Unit, onRestore: () -> Unit,
                onAutomatic: (Boolean) -> Unit, onSelectPackages: (Set<String>) -> Unit,
-               onLoadApps: () -> Unit) {
+               onLoadApps: () -> Unit, onNotifications: () -> Unit,
+               diagnostics: dev.aqua.audiopolicy.diagnostics.DiagnosticState,
+               onRecording: (Boolean) -> Unit, onDeleteLogs: () -> Unit, onCopyDiagnostics: () -> Unit) {
     var showPicker by rememberSaveable { mutableStateOf(false) }
     val connection = state.connection
     val snapshot = state.snapshot
@@ -138,9 +140,29 @@ fun MainScreen(state: MainUiState, onPermission: () -> Unit, onReload: () -> Uni
                 modifier = Modifier.fillMaxWidth()) { Text("再読み込み / 再接続") }
             Button(onClick = onRestore, enabled = canChange && snapshot?.canRestore == true,
                 modifier = Modifier.fillMaxWidth()) { Text(if (state.automation.enabled) "復元して自動切替を停止" else "保存した元の値へ復元") }
+            state.recoveryIssue?.let { Text(it.title + "\n" + it.detail, color = MaterialTheme.colorScheme.error) }
+            if (!state.notificationsEnabled) OutlinedButton(onClick = onNotifications) { Text("通知を許可する") }
             if (state.busy) CircularProgressIndicator(Modifier.semantics { contentDescription = "処理中" })
             snapshot?.warning?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             (state.error ?: connection.error)?.let { Text("エラー: $it", color = MaterialTheme.colorScheme.error) }
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("診断設定", style = MaterialTheme.typography.titleMedium)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("診断ログを記録", modifier = Modifier.weight(1f))
+                        Switch(checked = diagnostics.enabled, onCheckedChange = onRecording,
+                            enabled = diagnostics.ready,
+                            modifier = Modifier.semantics { contentDescription = "診断ログを記録" })
+                    }
+                    Text("初期値はOFFです。ONの間だけ操作・失敗・接続の変化を最大100件保存します。外部へ自動送信しません。",
+                        style = MaterialTheme.typography.bodySmall)
+                    Text("保存済みログ: ${diagnostics.entries.size} 件（OFFにしても残ります）")
+                    OutlinedButton(onClick = onCopyDiagnostics, enabled = !state.busy) { Text("診断情報をコピー") }
+                    OutlinedButton(onClick = onDeleteLogs) { Text("ログを削除") }
+                    diagnostics.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
+            }
             Text("効果は Android / メーカー実装に依存します。すべてのカメラ音が変わるとは限りません。",
                 style = MaterialTheme.typography.bodySmall)
         }
