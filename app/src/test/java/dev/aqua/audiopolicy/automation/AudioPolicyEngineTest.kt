@@ -164,4 +164,110 @@ class AudioPolicyEngineTest {
         assertTrue(f.engine.state.value.targetMatched)
         f.manager.close()
     }
+    @Test fun changedTargetsExcludingForegroundWaitForNormalExitDelay() = runTest {
+        val f = Fixture(this)
+        start(f)
+        f.engine.selectPackages(setOf("camera.b")); runCurrent()
+        advanceTimeBy(250); runCurrent() // First outside observation at 500ms.
+        assertEquals(listOf(0), f.remote.writes)
+        advanceTimeBy(750); runCurrent() // 750ms outside is still below 800ms.
+        assertEquals(listOf(0), f.remote.writes)
+        advanceTimeBy(250); runCurrent() // Next monitor tick after the deadline.
+        assertEquals(listOf(0, 11), f.remote.writes)
+        assertEquals(RestoreRecord(), f.store.record)
+        f.manager.close()
+    }
+    @Test fun changedTargetsStillIncludingForegroundKeepOverrideAndRecord() = runTest {
+        val f = Fixture(this)
+        start(f)
+        val before = f.store.record
+        f.engine.selectPackages(setOf("camera.a")); runCurrent()
+        advanceTimeBy(2000); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        assertEquals(before, f.store.record)
+        f.manager.close()
+    }
+    @Test fun returnToNewTargetDuringListChangeExitDelayCancelsRestore() = runTest {
+        val f = Fixture(this)
+        start(f)
+        f.engine.selectPackages(setOf("camera.b")); runCurrent()
+        advanceTimeBy(500); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        f.remote.top = "camera.b"
+        advanceTimeBy(2000); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        assertEquals(11, f.store.record.originalForceUse)
+        f.manager.close()
+    }
+    @Test fun resavingSameTargetsDoesNotShortenOrExtendPendingExit() = runTest {
+        val f = Fixture(this)
+        start(f)
+        f.remote.top = "home"
+        advanceTimeBy(250); runCurrent() // Exit begins at 500ms.
+        repeat(3) {
+            f.engine.selectPackages(setOf("camera.a", "camera.b")); runCurrent()
+            advanceTimeBy(250); runCurrent()
+            assertEquals(listOf(0), f.remote.writes)
+        }
+        advanceTimeBy(250); runCurrent() // 1500ms, original exit deadline is unchanged.
+        assertEquals(listOf(0, 11), f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun repeatedlyChangingNonemptyTargetsDoesNotPostponePendingExit() = runTest {
+        val f = Fixture(this)
+        start(f)
+        f.remote.top = "home"
+        advanceTimeBy(250); runCurrent()
+        repeat(3) { index ->
+            f.engine.selectPackages(setOf("camera.$index")); runCurrent()
+            advanceTimeBy(250); runCurrent()
+            assertEquals(listOf(0), f.remote.writes)
+        }
+        advanceTimeBy(250); runCurrent()
+        assertEquals(listOf(0, 11), f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun unknownForegroundAfterListChangeDoesNotCountAsExit() = runTest {
+        val f = Fixture(this)
+        start(f)
+        f.remote.top = ""
+        f.engine.selectPackages(setOf("camera.b")); runCurrent()
+        advanceTimeBy(2000); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        f.remote.top = "home"
+        advanceTimeBy(250); runCurrent()
+        advanceTimeBy(750); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        advanceTimeBy(250); runCurrent()
+        assertEquals(listOf(0, 11), f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun emptyTargetsAndExplicitOffStillRestoreImmediately() = runTest {
+        val f = Fixture(this)
+        start(f)
+        f.engine.selectPackages(emptySet()); runCurrent()
+        assertEquals(listOf(0, 11), f.remote.writes)
+        assertFalse(f.engine.state.value.automation.enabled)
+        f.engine.selectPackages(setOf("camera.a")); runCurrent()
+        f.engine.setAutomation(true); runCurrent()
+        advanceTimeBy(250); runCurrent()
+        assertEquals(listOf(0, 11, 0), f.remote.writes)
+        f.engine.setAutomation(false); runCurrent()
+        assertEquals(listOf(0, 11, 0, 11), f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun targetChangesAndEmptyTargetsNeverAlterManualOwnershipOrBackup() = runTest {
+        val f = Fixture(this)
+        start(f)
+        f.engine.setManual(true); runCurrent()
+        val before = f.store.record
+        f.engine.selectPackages(setOf("camera.b")); runCurrent()
+        advanceTimeBy(2000); runCurrent()
+        assertEquals(before, f.store.record)
+        f.engine.selectPackages(emptySet()); runCurrent()
+        assertEquals(before, f.store.record)
+        assertEquals(OverrideOwner.MANUAL, f.store.record.owner)
+        assertEquals(listOf(0), f.remote.writes)
+        f.manager.close()
+    }
 }

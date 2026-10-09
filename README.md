@@ -12,7 +12,7 @@ FORCE_SYSTEM_ENFORCED = 11
 ## ダウンロード
 
 [GitHub Releases](https://github.com/AQUALaforet/AudioPolicyOverride/releases/latest) の
-Assets から `AudioPolicyOverride-1.1.1.apk` をダウンロードしてインストールしてください。
+Assets から `AudioPolicyOverride-1.1.2.apk` をダウンロードしてインストールしてください。
 現在の配布 APK はデバッグ署名です。
 
 ## 動作

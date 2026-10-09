@@ -159,7 +159,8 @@ class AudioPolicyEngine internal constructor(private val app: Context,
         val targets = packages.filter { it.isNotBlank() && it != app.packageName }.toSet()
         repository.setTargets(targets)
         mutableState.update { it.copy(automation = it.automation.copy(packages = targets)) }
-        gate.reset()
+        // Preserve active and the original exit deadline for nonempty lists, including
+        // identical saves. The next observation uses the new targets; explicit stop resets.
         if (targets.isEmpty()) disableAutomation()
         else mutableState.update { it.copy(automaticSuspended = false) }
     }
