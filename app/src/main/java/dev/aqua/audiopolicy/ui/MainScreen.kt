@@ -140,6 +140,7 @@ fun MainScreen(state: MainUiState, onPermission: () -> Unit, onReload: () -> Uni
                 modifier = Modifier.fillMaxWidth()) { Text("再読み込み / 再接続") }
             Button(onClick = onRestore, enabled = canChange && snapshot?.canRestore == true,
                 modifier = Modifier.fillMaxWidth()) { Text(if (state.automation.enabled) "復元して自動切替を停止" else "保存した元の値へ復元") }
+            state.stopPersistenceError?.let { Text(it + "\nこのプロセスでは自動停止していますが、再起動後の停止は保証できません。", color = MaterialTheme.colorScheme.error) }
             state.recoveryIssue?.let { Text(it.title + "\n" + it.detail, color = MaterialTheme.colorScheme.error) }
             if (!state.notificationsEnabled) OutlinedButton(onClick = onNotifications) { Text("通知を許可する") }
             if (state.busy) CircularProgressIndicator(Modifier.semantics { contentDescription = "処理中" })

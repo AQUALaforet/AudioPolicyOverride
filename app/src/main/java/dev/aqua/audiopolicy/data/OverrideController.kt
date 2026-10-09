@@ -47,8 +47,9 @@ class OverrideController(private val port: AudioPolicyPort, private val store: R
         event(DiagnosticEvent("READ_BACK_FAILED", "", config, result, failure = e.javaClass.simpleName)); throw e
     }
 
-    suspend fun enable(owner: OverrideOwner = OverrideOwner.MANUAL, transferManual: Boolean = false): PolicySnapshot = transaction {
+    suspend fun enable(owner: OverrideOwner = OverrideOwner.MANUAL, transferManual: Boolean = false, canApply: () -> Boolean = { true }): PolicySnapshot = transaction {
         val before = readActual()
+        check(canApply()) { "停止要求によりON操作を取り消しました。" }
         require(ForceUse.supported(before.current)) { "想定外の値 ${before.current} のため変更できません。" }
         check(!before.record.changePending) { "前回の変更が未確認です。先に復元してください。" }
         check(!before.record.restoreRequested) { "復元待ちです。先に復元してください。" }
@@ -68,6 +69,7 @@ class OverrideController(private val port: AudioPolicyPort, private val store: R
         require(ForceUse.supported(original)) { "復元情報が不正です。" }
         val pending = RestoreRecord(original, before.record.overrideActive, true, owner)
         store.write(pending) // Never alter the system unless the recovery record is durable.
+        check(canApply()) { "停止要求によりON操作を取り消しました。復元情報を保持しています。" }
         val result = writeNative(ForceUse.NONE, "APPLY")
         if (result != 0) {
             // A failure code is not proof that reality stayed unchanged. Retain pending

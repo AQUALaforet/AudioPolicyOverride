@@ -4,6 +4,10 @@ import android.app.KeyguardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
+import android.content.Intent
+import android.os.Looper
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import android.os.PowerManager
 import dev.aqua.audiopolicy.aidl.IAudioPolicyService
 import dev.aqua.audiopolicy.data.*
@@ -26,10 +30,22 @@ import rikka.shizuku.Shizuku
 class AudioPolicyEngineTest {
     private class Store : PolicySettingsStore {
         override val automation = MutableStateFlow(AutomationSettings(true, setOf("camera.a", "camera.b")))
+        var failRead = false
+        var failRequest = false
+        var failOff = false
+        var offAttempts = 0
+        var onRecordWrite: ((RestoreRecord) -> Unit)? = null
         var record = RestoreRecord()
-        override suspend fun read() = record
-        override suspend fun write(record: RestoreRecord) { this.record = record }
-        override suspend fun setAutomationEnabled(enabled: Boolean) { automation.value = automation.value.copy(enabled = enabled) }
+        override suspend fun read(): RestoreRecord { if (failRead) throw java.io.IOException("record read failed"); return record }
+        override suspend fun write(record: RestoreRecord) {
+            if (failRequest && record.restoreRequested && !record.changePending) throw java.io.IOException("request save failed")
+            this.record = record
+            onRecordWrite?.invoke(record)
+        }
+        override suspend fun setAutomationEnabled(enabled: Boolean) {
+            if (!enabled) { offAttempts++; if (failOff) throw java.io.IOException("OFF save failed") }
+            automation.value = automation.value.copy(enabled = enabled)
+        }
         override suspend fun setTargets(packages: Set<String>) { automation.value = automation.value.copy(packages = packages) }
     }
     private class Access : ShizukuAccess {
@@ -51,6 +67,8 @@ class AudioPolicyEngineTest {
                                    permission: Shizuku.OnRequestPermissionResultListener) = Unit
     }
     private class Remote : IAudioPolicyService.Stub() {
+        var reads = 0
+        var foregroundReads = 0
         var current = 11
         var top = "camera.a"
         var onRead: (() -> Unit)? = null
@@ -58,9 +76,9 @@ class AudioPolicyEngineTest {
         var setResult = 0
         var readBackWrong = false
         val writes = mutableListOf<Int>()
-        override fun getForceUse(): Int { onRead?.invoke(); return current }
+        override fun getForceUse(): Int { reads++; onRead?.invoke(); return current }
         override fun setForceUse(config: Int): Int { writes += config; if (setResult == 0 && !readBackWrong) current = config; onWrite?.invoke(); return setResult }
-        override fun getForegroundPackage() = top
+        override fun getForegroundPackage(): String { foregroundReads++; return top }
         override fun destroy() = Unit
     }
     private class Fixture(scope: TestScope, diagnostics: DiagnosticRecorder = DiagnosticRecorder(object : DiagnosticStorage {
@@ -517,6 +535,251 @@ class AudioPolicyEngineTest {
         assertEquals(RestoreRecord(), f.store.record)
         assertNull(f.engine.state.value.recoveryIssue)
         assertNotNull(recorder.state.value.error)
+        f.manager.close()
+    }
+
+    @Test fun restoreRequestSaveFailureStillAttemptsPersistentOff() = runTest {
+        val f = Fixture(this); start(f); f.store.failRequest = true
+        f.engine.restore(); runCurrent()
+        assertTrue(f.store.offAttempts > 0)
+        assertFalse(f.engine.state.value.automation.enabled)
+        assertNotNull(f.engine.state.value.error)
+        assertEquals(listOf(0, 11), f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun manualOnSkipsForegroundCallsButOffUsesLatestForeground() = runTest {
+        val f = Fixture(this); start(f); f.engine.setManual(true); runCurrent()
+        val foreground = f.remote.foregroundReads; val reads = f.remote.reads
+        advanceTimeBy(4000); runCurrent()
+        assertEquals(foreground, f.remote.foregroundReads)
+        assertTrue(f.remote.reads > reads)
+        assertNull(f.engine.state.value.foregroundPackage)
+        f.remote.top = "camera.b"; f.engine.setManual(false); runCurrent()
+        assertTrue(f.remote.foregroundReads > foreground)
+        assertEquals(OverrideOwner.AUTOMATIC, f.store.record.owner)
+        assertEquals(listOf(0), f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun screenOffRestoresThenStopsPeriodicAudioReadsUntilWake() = runTest {
+        val f = Fixture(this); start(f)
+        shadowOf(f.context.getSystemService(PowerManager::class.java)).setIsInteractive(false)
+        advanceTimeBy(2500); runCurrent()
+        assertEquals(listOf(0, 11), f.remote.writes)
+        assertEquals(RestoreRecord(), f.store.record)
+        val reads = f.remote.reads; val foreground = f.remote.foregroundReads
+        advanceTimeBy(10000); runCurrent()
+        assertEquals(reads, f.remote.reads); assertEquals(foreground, f.remote.foregroundReads)
+        shadowOf(f.context.getSystemService(PowerManager::class.java)).setIsInteractive(true)
+        f.context.sendBroadcast(Intent(Intent.ACTION_SCREEN_ON)); shadowOf(Looper.getMainLooper()).idle(); runCurrent()
+        assertEquals(listOf(0, 11, 0), f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun slowDiagnosticCopyDoesNotHoldAudioOperationLock() = runTest {
+        val release = CompletableDeferred<Unit>()
+        val recorder = DiagnosticRecorder(object : DiagnosticStorage {
+            override suspend fun read(): DiagnosticState { release.await(); return DiagnosticState() }
+            override suspend fun write(state: DiagnosticState) = Unit
+        })
+        val f = Fixture(this, recorder); runCurrent()
+        val copy = async { f.engine.diagnosticInfo() }; runCurrent()
+        val manual = f.engine.setManual(true); runCurrent()
+        val completedBeforeRelease = manual.isCompleted
+        release.complete(Unit); runCurrent()
+        assertTrue(completedBeforeRelease)
+        assertTrue(copy.await().contains("FOR_SYSTEM: 11"))
+        assertTrue(f.engine.state.value.manualEnabled)
+        f.manager.close()
+    }
+
+    @Test fun bothSavesFailButStoredOnCannotReviveAutomaticProcessing() = runTest {
+        val f = Fixture(this); start(f)
+        f.store.failRequest = true; f.store.failOff = true
+        f.engine.setManual(true) // queued before stop: must be invalidated
+        f.engine.setAutomation(true)
+        f.engine.restore(); f.engine.setAutomation(true); runCurrent()
+        assertTrue(f.store.automation.value.enabled)
+        assertTrue(f.store.offAttempts > 0)
+        assertFalse(f.engine.state.value.automation.enabled)
+        assertTrue(f.engine.state.value.automaticStoppedInProcess)
+        assertNotNull(f.engine.state.value.stopPersistenceError)
+        val writes = f.remote.writes.toList()
+        // A new emission whose stored enabled value is still true.
+        f.store.automation.value = f.store.automation.value.copy(packages = setOf("camera.a"))
+        runCurrent(); f.engine.reload(); runCurrent()
+        f.disconnect(); runCurrent(); f.connect(); runCurrent()
+        f.engine.foreground(true); runCurrent(); advanceTimeBy(5000); runCurrent()
+        assertFalse(f.engine.state.value.automation.enabled)
+        assertTrue(f.engine.state.value.automaticStoppedInProcess)
+        assertNotNull(f.engine.state.value.stopPersistenceError)
+        assertEquals(writes, f.remote.writes)
+        // Explicit ON is the permitted release path, after settings storage recovers.
+        f.store.failRequest = false; f.store.failOff = false
+        f.engine.setAutomation(true); runCurrent(); advanceTimeBy(250); runCurrent()
+        assertTrue(f.engine.state.value.automation.enabled)
+        assertFalse(f.engine.state.value.automaticStoppedInProcess)
+        assertNull(f.engine.state.value.stopPersistenceError)
+        assertEquals(writes + 0, f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun stopDuringOnReadPreventsItsDelayedWrite() = runTest {
+        val f = Fixture(this); runCurrent()
+        var interrupted = false
+        f.remote.onRead = {
+            if (!interrupted) { interrupted = true; f.engine.restore() }
+        }
+        f.engine.setManual(true); runCurrent()
+        assertTrue(interrupted)
+        assertFalse(f.remote.writes.contains(0))
+        assertTrue(f.engine.state.value.automaticStoppedInProcess)
+        assertFalse(f.engine.state.value.automation.enabled)
+        f.manager.close()
+    }
+    @Test fun stopDuringAutomaticForegroundReadDoesNotApply() = runTest {
+        val f = Fixture(this); runCurrent()
+        f.remote.onRead = {
+            f.remote.onRead = null
+            f.engine.restore()
+        }
+        f.engine.attachMonitor(); runCurrent(); advanceTimeBy(250); runCurrent()
+        assertFalse(f.remote.writes.contains(0))
+        assertFalse(f.engine.state.value.automation.enabled)
+        f.manager.close()
+    }
+    @Test fun manualVerificationStillDetectsExternalChangeAndPreservesBackup() = runTest {
+        val f = Fixture(this); start(f); f.engine.setManual(true); runCurrent()
+        val foreground = f.remote.foregroundReads
+        f.remote.current = 11; advanceTimeBy(2250); runCurrent()
+        assertFalse(f.engine.state.value.manualEnabled)
+        assertTrue(f.engine.state.value.automaticSuspended)
+        assertEquals(11, f.store.record.originalForceUse)
+        assertEquals(OverrideOwner.MANUAL, f.store.record.owner)
+        assertEquals(foreground, f.remote.foregroundReads)
+        assertNotNull(f.engine.state.value.error)
+        f.manager.close()
+    }
+    @Test fun pendingManualRecordIsNotUsedToSkipSafetyChecks() = runTest {
+        val f = Fixture(this)
+        f.store.record = RestoreRecord(11, true, true, OverrideOwner.MANUAL)
+        f.remote.current = 0; start(f)
+        assertFalse(f.engine.state.value.manualEnabled)
+        assertTrue(f.engine.state.value.automaticSuspended)
+        assertTrue(f.remote.foregroundReads > 0)
+        assertTrue(f.store.record.changePending)
+        f.manager.close()
+    }
+    @Test fun lockRestoresOnceAndDuplicateWakeEventsDoNotApplyUntilUnlocked() = runTest {
+        val f = Fixture(this); start(f)
+        shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        advanceTimeBy(1750); runCurrent()
+        assertEquals(listOf(0, 11), f.remote.writes)
+        val reads = f.remote.reads
+        repeat(3) { f.context.sendBroadcast(Intent(Intent.ACTION_SCREEN_ON)) }
+        shadowOf(Looper.getMainLooper()).idle(); runCurrent(); advanceTimeBy(5000); runCurrent()
+        assertEquals(reads, f.remote.reads)
+        shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(false)
+        f.context.sendBroadcast(Intent(Intent.ACTION_USER_PRESENT)); shadowOf(Looper.getMainLooper()).idle(); runCurrent()
+        assertEquals(listOf(0, 11, 0), f.remote.writes)
+        f.manager.close()
+    }
+    @Test fun manualOnWhileScreenIdleWakesPeriodicVerificationWithoutForegroundReads() = runTest {
+        val f = Fixture(this); start(f)
+        shadowOf(f.context.getSystemService(PowerManager::class.java)).setIsInteractive(false)
+        advanceTimeBy(2500); runCurrent()
+        f.engine.setManual(true); runCurrent()
+        val reads = f.remote.reads; val foreground = f.remote.foregroundReads
+        advanceTimeBy(4000); runCurrent()
+        assertTrue(f.remote.reads > reads)
+        assertEquals(foreground, f.remote.foregroundReads)
+        assertTrue(f.engine.state.value.manualEnabled)
+        assertEquals(OverrideOwner.MANUAL, f.store.record.owner)
+        f.manager.close()
+    }
+    @Test fun screenOffFailedRestoreIsRetainedAndReloadCanCompleteIt() = runTest {
+        val f = Fixture(this); start(f); f.remote.setResult = -1
+        shadowOf(f.context.getSystemService(PowerManager::class.java)).setIsInteractive(false)
+        advanceTimeBy(2500); runCurrent()
+        assertTrue(f.store.record.hasRecovery)
+        assertNotNull(f.engine.state.value.recoveryIssue)
+        assertTrue(f.engine.state.value.automaticSuspended)
+        f.remote.setResult = 0; f.engine.reload(); runCurrent()
+        advanceTimeBy(3500); runCurrent()
+        assertEquals(RestoreRecord(), f.store.record)
+        val reads = f.remote.reads
+        advanceTimeBy(10000); runCurrent(); assertEquals(reads, f.remote.reads)
+        f.manager.close()
+    }
+    @Test fun slowDiagnosticCopyDoesNotBlockExplicitRestoreOrMixPolicyFacts() = runTest {
+        val release = CompletableDeferred<Unit>()
+        val recorder = DiagnosticRecorder(object : DiagnosticStorage {
+            override suspend fun read(): DiagnosticState { release.await(); return DiagnosticState() }
+            override suspend fun write(state: DiagnosticState) = Unit
+        })
+        val f = Fixture(this, recorder); start(f)
+        val copy = async { f.engine.diagnosticInfo() }; runCurrent()
+        val restore = f.engine.restore(); runCurrent()
+        val completedBeforeRelease = restore.isCompleted
+        release.complete(Unit); runCurrent()
+        assertTrue(completedBeforeRelease)
+        val text = copy.await()
+        assertTrue(text.contains("FOR_SYSTEM: 0"))
+        assertTrue(text.contains("originalForceUse=11"))
+        assertEquals(RestoreRecord(), f.store.record)
+        assertEquals(11, f.remote.current)
+        f.manager.close()
+    }
+
+    @Test fun stopAfterPendingSaveButBeforeNativeWriteCancelsOn() = runTest {
+        val f = Fixture(this); runCurrent()
+        f.store.onRecordWrite = { record ->
+            if (record.changePending && !record.restoreRequested) {
+                f.store.onRecordWrite = null
+                f.engine.restore()
+            }
+        }
+        f.engine.setManual(true); runCurrent()
+        assertFalse(f.remote.writes.contains(0))
+        assertEquals(RestoreRecord(), f.store.record)
+        assertTrue(f.engine.state.value.automaticStoppedInProcess)
+        f.manager.close()
+    }
+    @Test fun staleAutomaticOnCannotClearStopAfterItsSuspendedRead() = runTest {
+        val f = Fixture(this); runCurrent()
+        f.remote.onRead = { f.remote.onRead = null; f.engine.restore() }
+        f.engine.setAutomation(true); runCurrent(); advanceTimeBy(1000); runCurrent()
+        assertTrue(f.engine.state.value.automaticStoppedInProcess)
+        assertFalse(f.engine.state.value.automation.enabled)
+        assertFalse(f.remote.writes.contains(0))
+        f.manager.close()
+    }
+    @Test fun monitorReattachAndDuplicateScreenEventsKeepOneOwnerAndBackup() = runTest {
+        val f = Fixture(this); start(f); f.engine.attachMonitor(); runCurrent()
+        f.engine.detachMonitor(); runCurrent()
+        assertEquals(listOf(0, 11), f.remote.writes)
+        f.context.sendBroadcast(Intent(Intent.ACTION_SCREEN_ON)); shadowOf(Looper.getMainLooper()).idle()
+        advanceTimeBy(1000); runCurrent(); assertEquals(listOf(0, 11), f.remote.writes)
+        f.engine.attachMonitor(); f.engine.attachMonitor(); runCurrent()
+        repeat(3) { f.context.sendBroadcast(Intent(Intent.ACTION_USER_PRESENT)) }
+        shadowOf(Looper.getMainLooper()).idle(); runCurrent(); advanceTimeBy(1000); runCurrent()
+        assertEquals(listOf(0, 11, 0), f.remote.writes)
+        assertEquals(11, f.store.record.originalForceUse)
+        assertEquals(OverrideOwner.AUTOMATIC, f.store.record.owner)
+        f.engine.detachMonitor(); runCurrent(); f.manager.close()
+    }
+
+    @Test fun unreadableBackupStillStopsAndRetainsLastKnownRecoveryNotice() = runTest {
+        val f = Fixture(this); start(f)
+        f.store.failRead = true; f.engine.restore(); runCurrent()
+        assertTrue(f.store.offAttempts > 0)
+        assertTrue(f.engine.state.value.automaticStoppedInProcess)
+        assertFalse(f.engine.state.value.automation.enabled)
+        assertNotNull(f.engine.state.value.recoveryIssue)
+        assertNotNull(f.engine.state.value.stopPersistenceError)
+        assertEquals(11, f.store.record.originalForceUse)
+        assertEquals(listOf(0), f.remote.writes)
+        f.store.failRead = false; f.engine.reload(); runCurrent()
+        assertEquals(RestoreRecord(), f.store.record)
+        assertEquals(listOf(0, 11), f.remote.writes)
+        assertNull(f.engine.state.value.recoveryIssue)
         f.manager.close()
     }
 }

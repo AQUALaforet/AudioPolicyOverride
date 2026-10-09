@@ -2,6 +2,10 @@ package dev.aqua.audiopolicy.automation
 
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.BroadcastReceiver
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeoutOrNull
 import android.os.PowerManager
 import android.app.NotificationManager
 import android.app.KeyguardManager
@@ -50,6 +54,8 @@ data class PolicyUiState(
     val monitorRunning: Boolean = false,
     val targetMatched: Boolean = false,
     val automaticSuspended: Boolean = false,
+    val automaticStoppedInProcess: Boolean = false,
+    val stopPersistenceError: String? = null,
     val foregroundPackage: String? = null,
     val apps: List<AppChoice> = emptyList(),
     val appsLoading: Boolean = false,
@@ -83,6 +89,13 @@ class AudioPolicyEngine internal constructor(private val app: Context,
     private var restoreJob: Job? = null
     private var tileJob: Deferred<Boolean>? = null
     private var commandEpoch = 0L
+    private var automaticStopped = false
+    private var restorePendingInProcess = false
+    private val monitorWake = Channel<Unit>(Channel.CONFLATED)
+    private var screenReceiverRegistered = false
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) { monitorWake.trySend(Unit) }
+    }
     private var restoreFailure: String? = null
     private val notifier = RecoveryNotifier(app)
     private var uiVisible = false
@@ -105,8 +118,8 @@ class AudioPolicyEngine internal constructor(private val app: Context,
         scope.launch {
             try {
                 repository.automation.collect { settings ->
-                    mutableState.update { it.copy(automation = settings, settingsReady = true) }
-                    if (settings.enabled && uiVisible) {
+                    mutableState.update { it.copy(automation = settings.copy(enabled = settings.enabled && !automaticStopped), settingsReady = true) }
+                    if (settings.enabled && !automaticStopped && uiVisible) {
                         try { ensureService() } catch (e: Exception) { report(e, true) }
                     }
                     if (!settings.enabled && manager.state.value.connected) {
@@ -146,6 +159,7 @@ class AudioPolicyEngine internal constructor(private val app: Context,
                             publish(releaseAutomatic())
                         }
                         if (manager.state.value.connected && manager.state.value.session == expectedSession) validatedSession = expectedSession
+                        monitorWake.trySend(Unit)
                     }
                 }
                 session = connection.session
@@ -211,8 +225,12 @@ class AudioPolicyEngine internal constructor(private val app: Context,
                 check(ForceUse.supported(snapshot.current)) { "現在値が想定外のため自動切替を開始できません。" }
                 check(!snapshot.record.changePending) { "前回の変更が未確認です。先に復元してください。" }
                 check(!snapshot.record.restoreRequested) { "復元待ちです。先に復元してください。" }
+                check(snapshot.warning == null && (!snapshot.record.hasRecovery || snapshot.enabled)) { "復元記録と実際の値を確認できません。先に復元してください。" }
+                if (epoch != commandEpoch || restoreJob?.isActive == true) return@operate
                 repository.setAutomationEnabled(true)
-                mutableState.update { it.copy(automation = it.automation.copy(enabled = true), automaticSuspended = false) }
+                if (epoch != commandEpoch || restoreJob?.isActive == true) return@operate
+                automaticStopped = false // only an explicit, validated ON clears the process stop
+                mutableState.update { it.copy(automation = it.automation.copy(enabled = true), automaticSuspended = false, automaticStoppedInProcess = false, stopPersistenceError = null) }
                 try { ensureService() }
                 catch (e: Exception) {
                     repository.setAutomationEnabled(false)
@@ -243,13 +261,19 @@ class AudioPolicyEngine internal constructor(private val app: Context,
     }
     private suspend fun manual(enabled: Boolean, source: String = "UI") {
         operationSource = source
+        val epoch = commandEpoch
         val target = if (!enabled && state.value.automation.enabled && !state.value.automaticSuspended) observeTarget() else false
         try {
-            val snapshot = automaticPolicy.setManual(enabled, target == true)
+            val snapshot = automaticPolicy.setManual(enabled, target == true) { epoch == commandEpoch && restoreJob?.isActive != true }
             // A verified manual ON supersedes a previous implicit OFF/auto exit intent.
             // An explicit restoreRequested transaction is rejected by the controller.
             if (enabled && snapshot.enabled) restoreFailure = null
             publish(snapshot)
+            monitorWake.trySend(Unit)
+            if (enabled) {
+                gate.reset()
+                mutableState.update { it.copy(foregroundPackage = null, targetMatched = false) }
+            } else if (target == true) gate.update(true, elapsed()) else gate.reset()
             recordDiagnostic(DiagnosticEvent(if (enabled) "MANUAL_ON" else "MANUAL_OFF", source, readBack = snapshot.current))
         }
         catch (e: Exception) { if (!enabled && target != true) syncRecovery(e.message); throw e }
@@ -258,30 +282,56 @@ class AudioPolicyEngine internal constructor(private val app: Context,
     fun restore(source: String = "UI"): Job {
         restoreJob?.takeIf { it.isActive }?.let { return it }
         ++commandEpoch
-        val job = operate(start = CoroutineStart.LAZY, source = source) {
-            try {
-                controller.requestRestore()
-                stopAutomaticSettings()
-                publish(controller.restoreIfPresent())
-                recordDiagnostic(DiagnosticEvent("RESTORED_AND_STOPPED", source, readBack = state.value.snapshot?.current))
-            } catch (e: Exception) { syncRecovery(e.message); throw e }
-            finally { app.stopService(Intent(app, AutomationService::class.java)) }
-        }
+        stopInProcess()
+        restorePendingInProcess = true
+        val job = operate(start = CoroutineStart.LAZY, source = source) { performExplicitRestore(source) }
         restoreJob = job
         job.start()
         return job
     }
-    private suspend fun stopAutomaticSettings() {
-        repository.setAutomationEnabled(false)
-        mutableState.update { it.copy(automation = it.automation.copy(enabled = false), targetMatched = false) }
+    private fun stopInProcess() {
+        automaticStopped = true
         gate.reset()
+        mutableState.update { it.copy(automation = it.automation.copy(enabled = false),
+            automaticStoppedInProcess = true, targetMatched = false, foregroundPackage = null) }
+    }
+    private suspend fun stopAutomaticSettings() {
+        stopInProcess() // takes effect even when DataStore.edit fails
+        repository.setAutomationEnabled(false)
+    }
+    private suspend fun performExplicitRestore(source: String) {
+        val failures = mutableListOf<String>()
+        val persistenceFailures = mutableListOf<String>()
+        suspend fun attempt(label: String, persistence: Boolean = false, block: suspend () -> Unit) {
+            try { block() } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                val message = "$label: ${e.message ?: e.javaClass.simpleName}"
+                failures += message
+                if (persistence) persistenceFailures += message
+            }
+        }
+        try {
+            // Independent attempts: saving the recovery intent must not prevent saving OFF.
+            attempt("復元要求を保存できませんでした", true) { controller.requestRestore() }
+            attempt("自動OFFを保存できませんでした", true) { stopAutomaticSettings() }
+            mutableState.update { it.copy(stopPersistenceError = persistenceFailures.takeIf { errors -> errors.isNotEmpty() }?.joinToString("\n")) }
+            // The controller still requires a valid original and a durable pending write.
+            attempt("復元を完了できませんでした") { publish(controller.restoreIfPresent()) }
+            if (failures.isNotEmpty()) {
+                val error = IllegalStateException(failures.joinToString("\n"))
+                syncRecovery(error.message)
+                throw error
+            }
+            recordDiagnostic(DiagnosticEvent("RESTORED_AND_STOPPED", source, readBack = state.value.snapshot?.current))
+        } finally { app.stopService(Intent(app, AutomationService::class.java)) }
     }
     private suspend fun resumeExplicitRestore() {
         operationSource = "RECOVERY"
-        if (state.value.recoveryRecord?.restoreRequested != true) return
-        try { stopAutomaticSettings(); publish(controller.restoreIfPresent()) }
-        catch (e: Exception) { syncRecovery(e.message); throw e }
-        finally { app.stopService(Intent(app, AutomationService::class.java)) }
+        if (!restorePendingInProcess && state.value.recoveryRecord?.restoreRequested != true) return
+        if (!automaticStopped) ++commandEpoch
+        stopInProcess()
+        restorePendingInProcess = true
+        performExplicitRestore("RECOVERY")
     }
     fun refreshForTile() {
         manager.refresh()
@@ -316,12 +366,17 @@ class AudioPolicyEngine internal constructor(private val app: Context,
         // Explicit recovery owns the next retry. OFF collectors and service teardown
         // must not start a second restore immediately after its failed transaction.
         val actual = controller.read()
-        if (actual.record.restoreRequested) actual else controller.releaseAutomatic()
+        if (automaticStopped || actual.record.restoreRequested) actual else controller.releaseAutomatic()
     }
     catch (e: Exception) { syncRecovery(e.message); throw e }
     private suspend fun syncRecovery(failure: String? = null) {
         if (failure != null) restoreFailure = failure
-        val record = repository.read()
+        val record = try { repository.read() } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            // A failed read cannot prove that the last known backup was cleared.
+            mutableState.update { it.copy(recoveryIssue = recoveryIssue(it.recoveryRecord, manager.state.value.connected, restoreFailure)) }
+            throw e
+        }
         if (!record.hasRecovery) restoreFailure = null
         mutableState.update { it.copy(recoveryRecord = record,
             recoveryIssue = recoveryIssue(record, manager.state.value.connected, restoreFailure)) }
@@ -333,29 +388,34 @@ class AudioPolicyEngine internal constructor(private val app: Context,
     }
     fun setDiagnosticRecording(enabled: Boolean) = scope.launch { diagnostics.setEnabled(enabled) }
     fun deleteDiagnosticLogs() = scope.launch { diagnostics.clear() }
-    suspend fun diagnosticInfo(): String = mutex.withLock {
-        val current = try { controller.read().also(::publish).current.toString() }
-            catch (_: Exception) { "取得できません（未接続または読み取り失敗）" }
-        val record = try { repository.read().toString() } catch (_: Exception) { "取得できません" }
+    suspend fun diagnosticInfo(): String {
+        // Capture only policy facts under the operation lock. Disk IO and formatting
+        // below use immutable local snapshots and cannot block another audio command.
+        val facts = mutex.withLock {
+            val snapshot = try { controller.read().also(::publish) } catch (_: Exception) { null }
+            val record = snapshot?.record ?: try { repository.read() } catch (_: Exception) { null }
+            Triple(snapshot?.current, record, manager.state.value)
+        }
         diagnostics.load()
-        val connection = manager.state.value
-        buildString {
+        val diagnosticSnapshot = diagnostics.state.value.let { it.copy(entries = it.entries.toList()) }
+        val (current, record, connection) = facts
+        return buildString {
             appendLine("Audio Policy Override ${dev.aqua.audiopolicy.BuildConfig.VERSION_NAME}")
             appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
             appendLine("Android: ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}")
             appendLine("Connection: installed=${connection.installed}, running=${connection.running}, ready=${connection.ready}, granted=${connection.granted}, connected=${connection.connected}")
-            appendLine("FOR_SYSTEM: $current")
-            appendLine("Recovery: $record")
-            appendLine("Recording: ${diagnostics.state.value.enabled}")
-            if (diagnostics.state.value.entries.isNotEmpty()) {
-                appendLine("History (latest ${diagnostics.state.value.entries.size}):")
-                diagnostics.state.value.entries.forEach { appendLine("${it.time} ${it.event}") }
+            appendLine("FOR_SYSTEM: ${current ?: "取得できません（未接続または読み取り失敗）"}")
+            appendLine("Recovery: ${record ?: "取得できません"}")
+            appendLine("Recording: ${diagnosticSnapshot.enabled}")
+            if (diagnosticSnapshot.entries.isNotEmpty()) {
+                appendLine("History (latest ${diagnosticSnapshot.entries.size}):")
+                diagnosticSnapshot.entries.forEach { appendLine("${it.time} ${it.event}") }
             }
         }
     }
 
     private fun ensureService() {
-        if (state.value.monitorRunning || serviceStarting) return
+        if (automaticStopped || state.value.monitorRunning || serviceStarting) return
         serviceStarting = true
         try { app.startForegroundService(Intent(app, AutomationService::class.java)) }
         catch (e: Exception) { serviceStarting = false; throw e }
@@ -363,11 +423,13 @@ class AudioPolicyEngine internal constructor(private val app: Context,
     fun attachMonitor() {
         serviceStarting = false
         if (pollJob?.isActive == true) return
+        registerScreenReceiver()
         seedGateFromRecovery()
         val generation = ++monitorGeneration
         mutableState.update { it.copy(monitorRunning = true) }
         pollJob = scope.launch {
             var retryAt = 0L
+            var screenIdle = false
             while (true) {
                 val now = elapsed()
                 if (state.value.settingsReady && !manager.state.value.connected && now >= retryAt) {
@@ -375,15 +437,38 @@ class AudioPolicyEngine internal constructor(private val app: Context,
                     retryAt = now + 5_000
                 }
                 if (state.value.settingsReady && manager.state.value.connected &&
-                    validatedSession == manager.state.value.session && !state.value.automaticSuspended && restoreJob?.isActive != true) {
+                    validatedSession == manager.state.value.session && !automaticStopped && !state.value.automaticSuspended && restoreJob?.isActive != true) {
                     try {
                         mutex.withLock {
                             currentCoroutineContext().ensureActive()
-                            if (generation == monitorGeneration && !state.value.automaticSuspended && manager.state.value.connected && restoreJob?.isActive != true) {
+                            if (generation == monitorGeneration && !automaticStopped && !state.value.automaticSuspended && manager.state.value.connected && restoreJob?.isActive != true) {
+                                val nowLocked = elapsed()
+                                val screenUnavailable = !power.isInteractive || keyguard.isKeyguardLocked
+                                val verified = state.value.snapshot
+                                if (state.value.manualEnabled && verified?.warning == null) {
+                                    screenIdle = false
+                                    mutableState.update { it.copy(foregroundPackage = null, targetMatched = false) }
+                                    if (nowLocked - lastRead >= 2_000) {
+                                        val actual = controller.read()
+                                        publish(actual)
+                                        check(actual.enabled && actual.record.owner == OverrideOwner.MANUAL && actual.warning == null) {
+                                            "手動Overrideの保存状態と実際の値が一致しません。復元情報を保持しています。"
+                                        }
+                                    }
+                                    return@withLock
+                                }
+                                if (screenUnavailable && verified != null && ForceUse.supported(verified.current) && verified.warning == null && !verified.record.hasRecovery &&
+                                    state.value.recoveryIssue == null && !restorePendingInProcess) {
+                                    screenIdle = true
+                                    mutableState.update { it.copy(foregroundPackage = null, targetMatched = false) }
+                                    return@withLock
+                                }
+                                if (screenIdle && !screenUnavailable) publish(controller.read())
+                                screenIdle = false
                                 // Observe after taking the lock, not before waiting behind commands.
                                 val matched = observeTarget()
                                 currentCoroutineContext().ensureActive()
-                                if (generation != monitorGeneration) return@withLock
+                                if (generation != monitorGeneration || automaticStopped || restoreJob?.isActive == true) return@withLock
                                 val observedAt = elapsed()
                                 val desired = gate.update(matched, observedAt)
                                 mutableState.update { it.copy(targetMatched = desired) }
@@ -395,9 +480,27 @@ class AudioPolicyEngine internal constructor(private val app: Context,
                         report(e, true)
                     }
                 }
-                delay(if (power.isInteractive && !state.value.automaticSuspended) 250 else 1_000)
+                val interval = when {
+                    screenIdle && screenReceiverRegistered -> 30_000L
+                    screenIdle -> 1_000L
+                    !power.isInteractive || state.value.automaticSuspended -> 1_000L
+                    else -> 250L
+                }
+                withTimeoutOrNull(interval) { monitorWake.receive() }
             }
         }
+    }
+    @Suppress("DEPRECATION")
+    private fun registerScreenReceiver() {
+        if (screenReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON); addAction(Intent.ACTION_SCREEN_OFF); addAction(Intent.ACTION_USER_PRESENT)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 33) app.registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            else app.registerReceiver(screenReceiver, filter)
+            screenReceiverRegistered = true
+        } catch (_: Exception) { /* retain a one-second screen-state fallback */ }
     }
     private fun seedGateFromRecovery() {
         val snapshot = state.value.snapshot
@@ -421,7 +524,7 @@ class AudioPolicyEngine internal constructor(private val app: Context,
         val needsEnable = wantsAutomatic && cached?.enabled != true
         val needsRelease = !wantsAutomatic && cached?.record?.owner == OverrideOwner.AUTOMATIC && cached.canRestore
         if (now - lastRead >= 2_000 || needsEnable || needsRelease || cached == null) {
-            try { publish(automaticPolicy.reconcile(wantsAutomatic) {
+            try { publish(automaticPolicy.reconcile(wantsAutomatic, canApply = { !automaticStopped && restoreJob?.isActive != true }) {
                 val latest = observeTarget()
                 val latestDesired = gate.update(latest, elapsed())
                 mutableState.update { it.copy(targetMatched = latestDesired) }
@@ -430,6 +533,10 @@ class AudioPolicyEngine internal constructor(private val app: Context,
         }
     }
     fun detachMonitor() {
+        if (screenReceiverRegistered) {
+            screenReceiverRegistered = false
+            try { app.unregisterReceiver(screenReceiver) } catch (_: Exception) { /* already removed */ }
+        }
         pollJob?.cancel()
         ++monitorGeneration
         pollJob = null
@@ -443,7 +550,7 @@ class AudioPolicyEngine internal constructor(private val app: Context,
     }
     private fun publish(snapshot: PolicySnapshot) {
         lastRead = elapsed()
-        if (!snapshot.record.hasRecovery) restoreFailure = null
+        if (!snapshot.record.hasRecovery) { restoreFailure = null; restorePendingInProcess = false }
         mutableState.update { it.copy(snapshot = if (manager.state.value.connected) snapshot else null,
             recoveryRecord = snapshot.record, recoveryIssue = recoveryIssue(snapshot.record, manager.state.value.connected, restoreFailure)) }
     }
