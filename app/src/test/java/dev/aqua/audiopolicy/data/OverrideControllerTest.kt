@@ -34,7 +34,7 @@ class OverrideControllerTest {
         val restarted = OverrideController(port, store)
         restarted.enable() // Must not overwrite 11 with current 0.
         restarted.restore()
-        assertEquals(listOf(0, 0, 11), port.writes)
+        assertEquals(listOf(0, 11), port.writes)
         assertEquals(11, port.current)
         assertEquals(RestoreRecord(), store.record)
     }

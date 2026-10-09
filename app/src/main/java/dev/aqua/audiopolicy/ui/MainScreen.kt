@@ -67,7 +67,7 @@ fun MainScreen(state: MainUiState, onPermission: () -> Unit, onReload: () -> Uni
                         else -> "未インストール"
                     })
                     Text("権限: " + when {
-                        !connection.running -> "確認できません"
+                        !connection.running || !connection.ready -> "確認できません"
                         connection.granted -> "許可済み"
                         else -> "未許可"
                     })
@@ -78,7 +78,7 @@ fun MainScreen(state: MainUiState, onPermission: () -> Unit, onReload: () -> Uni
                     })
                 }
             }
-            if (connection.running && !connection.granted) {
+            if (connection.running && connection.ready && !connection.granted) {
                 Button(onClick = onPermission) { Text("Shizuku 権限を許可") }
             }
             if (!connection.running) {

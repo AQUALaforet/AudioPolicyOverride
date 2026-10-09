@@ -130,7 +130,7 @@ DataStore に `originalForceUse`、`overrideActive`、`changePending`、`overrid
 所有者は MANUAL または AUTOMATIC です。v1.0 の既存復元記録は MANUAL として引き継ぎます。
 `automationEnabled`、`targetPackages` に自動設定を保存します。
 元の値を永続保存できなければ AudioSystem を変更しません。
-成功応答（戻り値 0）を受け取った後にのみ `overrideActive` を更新します。
+成功応答（戻り値 0）と読み戻しの一致を確認した後にのみ `overrideActive` を更新します。
 変更途中のプロセス終了や応答喪失に備えた `changePending` は、完了不明の警告を表示します。
 復元成功後の読み戻しで一致を確認したときに記録を消去します。
 複数回 ON にしても元の 11 を現在の 0 で上書きしません。
@@ -176,7 +176,7 @@ Logcat タグ: `ShizukuManager`、`AudioPolicyUserService`、`AudioPolicyEngine`
 Shizuku / UserService 接続、get 結果、set 引数・戻り値、reflection / Binder 例外、復元要求を記録します。
 認証情報などの秘密情報は記録しません。
 
-単体テスト26件は UserService の入力制限、正常な有効化・再起動後の復元、二重 ON、非 0 戻り値、UNKNOWN、
+単体テストは UserService の入力制限、正常な有効化・再起動後の復元、二重 ON、非 0 戻り値、UNKNOWN、
 保存失敗、Binder 応答喪失、保存状態との不一致、読み戻し不一致、不正な復元値、
 対象間の切り替え・解除の待ち時間・手動優先・所有者の引き継ぎ・自動所有記録の再起動復元を確認します。
 実機では ADB 起動、拒否 / 許可、Shizuku 停止・再起動、画面回転、アプリ再起動、
@@ -187,3 +187,4 @@ ON / OFF と復元、および使用するカメラアプリの音を確認し�
 [Android 17 SDK](https://developer.android.com/about/versions/17/setup-sdk)。
 
 今回のビルド・単体テスト・実機確認の結果は [検証結果](verification/RESULTS.md) にまとめています。
+切断・復元・所有権・並行処理に関する修正は [信頼性レビュー](verification/RELIABILITY_REVIEW.md) を参照してください。

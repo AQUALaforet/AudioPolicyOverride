@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.PowerManager
 import android.app.NotificationManager
+import android.app.KeyguardManager
 import android.os.SystemClock
 import android.util.Log
 import dev.aqua.audiopolicy.ForceUse
@@ -14,6 +15,7 @@ import dev.aqua.audiopolicy.data.OverrideController
 import dev.aqua.audiopolicy.data.OverrideOwner
 import dev.aqua.audiopolicy.data.PolicySnapshot
 import dev.aqua.audiopolicy.data.SettingsRepository
+import dev.aqua.audiopolicy.data.PolicySettingsStore
 import dev.aqua.audiopolicy.shizuku.ConnectionState
 import dev.aqua.audiopolicy.shizuku.ShizukuManager
 import kotlinx.coroutines.CancellationException
@@ -22,6 +24,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -49,10 +53,11 @@ data class PolicyUiState(
 }
 
 /** The Activity and foreground service share one manager, controller and operation lock. */
-class AudioPolicyEngine(private val app: Context) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val repository = SettingsRepository(app)
-    private val manager = ShizukuManager(app)
+class AudioPolicyEngine internal constructor(private val app: Context,
+    private val repository: PolicySettingsStore, private val manager: ShizukuManager,
+    private val scope: CoroutineScope, private val elapsed: () -> Long = SystemClock::elapsedRealtime) {
+    constructor(app: Context) : this(app, SettingsRepository(app), ShizukuManager(app),
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate))
     private val controller = OverrideController(manager, repository)
     private val automaticPolicy = AutomaticPolicy(controller)
     private val catalog = AppCatalog(app)
@@ -63,8 +68,11 @@ class AudioPolicyEngine(private val app: Context) {
     private var pollJob: Job? = null
     private var uiVisible = false
     private var serviceStarting = false
+    private var monitorGeneration = 0L
+    private var validatedSession = -1L
     private var lastRead = 0L
     private val power = app.getSystemService(PowerManager::class.java)
+    private val keyguard = app.getSystemService(KeyguardManager::class.java)
 
     init {
         scope.launch {
@@ -88,16 +96,22 @@ class AudioPolicyEngine(private val app: Context) {
         scope.launch {
             var session = -1L
             manager.state.collect { connection ->
+                val newSession = connection.connected && connection.session != session
+                if (!connection.connected || newSession) validatedSession = -1L
                 mutableState.update { it.copy(connection = connection,
-                    snapshot = if (connection.connected) it.snapshot else null) }
-                if (connection.connected && connection.session != session) {
-                    gate.reset()
-                    mutableState.update { it.copy(automaticSuspended = false) }
+                    snapshot = if (connection.connected && !newSession) it.snapshot else null) }
+                if (newSession) {
+                    val expectedSession = connection.session
                     operate(showBusy = false, suspendAutomatic = true) {
+                        if (!manager.state.value.connected || manager.state.value.session != expectedSession) return@operate
+                        gate.reset()
+                        mutableState.update { it.copy(automaticSuspended = false, targetMatched = false) }
                         publish(controller.read())
+                        seedGateFromRecovery()
                         if (state.value.settingsReady && !state.value.automation.enabled) {
                             publish(controller.releaseAutomatic())
                         }
+                        if (manager.state.value.connected && manager.state.value.session == expectedSession) validatedSession = expectedSession
                     }
                 }
                 session = connection.session
@@ -111,15 +125,24 @@ class AudioPolicyEngine(private val app: Context) {
         if (visible) {
             mutableState.update { it.copy(notificationsEnabled = app.getSystemService(NotificationManager::class.java).areNotificationsEnabled()) }
             reload()
-            if (state.value.settingsReady && state.value.automation.enabled) ensureService()
+            if (state.value.settingsReady && state.value.automation.enabled) {
+                try { ensureService() } catch (e: Exception) { report(e, true) }
+            }
         }
     }
     fun requestPermission() = manager.requestPermission()
     fun reload() {
         manager.refresh()
-        gate.reset()
-        mutableState.update { it.copy(automaticSuspended = false, error = null) }
-        if (manager.state.value.connected) operate { publish(controller.read()) }
+        operate {
+            gate.reset()
+            mutableState.update { it.copy(automaticSuspended = false, targetMatched = false, error = null) }
+            if (manager.state.value.connected) {
+                publish(controller.read())
+                seedGateFromRecovery()
+                validatedSession = manager.state.value.session
+                if (state.value.settingsReady && !state.value.automation.enabled) publish(controller.releaseAutomatic())
+            }
+        }
     }
     fun loadApps() {
         scope.launch {
@@ -171,8 +194,9 @@ class AudioPolicyEngine(private val app: Context) {
     }
     fun setManual(enabled: Boolean) = operate {
         Log.i(TAG, "Manual override requested: enabled=$enabled")
+        val target = if (!enabled && state.value.automation.enabled && !state.value.automaticSuspended) observeTarget() else false
         publish(automaticPolicy.setManual(enabled,
-            state.value.automation.enabled && state.value.targetMatched && !state.value.automaticSuspended))
+            target == true))
     }
     fun restore() = operate {
         Log.i(TAG, "Explicit restore requested; stopping automatic mode")
@@ -193,23 +217,32 @@ class AudioPolicyEngine(private val app: Context) {
     fun attachMonitor() {
         serviceStarting = false
         if (pollJob?.isActive == true) return
+        seedGateFromRecovery()
+        val generation = ++monitorGeneration
         mutableState.update { it.copy(monitorRunning = true) }
         pollJob = scope.launch {
             var retryAt = 0L
             while (true) {
-                val now = SystemClock.elapsedRealtime()
+                val now = elapsed()
                 if (state.value.settingsReady && !manager.state.value.connected && now >= retryAt) {
                     manager.refresh()
                     retryAt = now + 5_000
                 }
-                if (state.value.settingsReady && manager.state.value.connected && !state.value.automaticSuspended) {
+                if (state.value.settingsReady && manager.state.value.connected &&
+                    validatedSession == manager.state.value.session && !state.value.automaticSuspended) {
                     try {
-                        val top = if (power.isInteractive) manager.getForegroundPackage() else ""
-                        val matched = state.value.automation.enabled && top in state.value.automation.packages
-                        val desired = gate.update(matched, now)
-                        mutableState.update { it.copy(foregroundPackage = top.takeIf(String::isNotEmpty), targetMatched = desired) }
                         mutex.withLock {
-                            if (!state.value.automaticSuspended) reconcile(desired, now)
+                            currentCoroutineContext().ensureActive()
+                            if (generation == monitorGeneration && !state.value.automaticSuspended && manager.state.value.connected) {
+                                // Observe after taking the lock, not before waiting behind commands.
+                                val matched = observeTarget()
+                                currentCoroutineContext().ensureActive()
+                                if (generation != monitorGeneration) return@withLock
+                                val observedAt = elapsed()
+                                val desired = gate.update(matched, observedAt)
+                                mutableState.update { it.copy(targetMatched = desired) }
+                                if (matched != null) reconcile(desired, observedAt)
+                            }
                         }
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
@@ -220,6 +253,21 @@ class AudioPolicyEngine(private val app: Context) {
             }
         }
     }
+    private fun seedGateFromRecovery() {
+        val snapshot = state.value.snapshot
+        if (snapshot?.current == ForceUse.NONE && snapshot.record.owner == OverrideOwner.AUTOMATIC && snapshot.canRestore) {
+            gate.update(true, elapsed())
+        }
+    }
+    private suspend fun observeTarget(): Boolean? {
+        if (!state.value.automation.enabled || !power.isInteractive || keyguard.isKeyguardLocked) {
+            mutableState.update { it.copy(foregroundPackage = null) }
+            return false
+        }
+        val top = manager.getForegroundPackage()
+        mutableState.update { it.copy(foregroundPackage = top.takeIf(String::isNotEmpty)) }
+        return if (top.isEmpty()) null else top in state.value.automation.packages
+    }
     private suspend fun reconcile(desired: Boolean, now: Long) {
         val cached = state.value.snapshot
         val wantsAutomatic = desired && state.value.automation.enabled
@@ -228,11 +276,17 @@ class AudioPolicyEngine(private val app: Context) {
         if (now - lastRead >= 2_000 || needsEnable || needsRelease || cached == null) {
             if (needsEnable) Log.i(TAG, "Selected app entered foreground; applying automatic override")
             if (needsRelease) Log.i(TAG, "Selected apps left foreground; restoring automatic override")
-            publish(automaticPolicy.reconcile(wantsAutomatic))
+            publish(automaticPolicy.reconcile(wantsAutomatic) {
+                val latest = observeTarget()
+                val latestDesired = gate.update(latest, elapsed())
+                mutableState.update { it.copy(targetMatched = latestDesired) }
+                latest == false && !latestDesired
+            })
         }
     }
     fun detachMonitor() {
         pollJob?.cancel()
+        ++monitorGeneration
         pollJob = null
         serviceStarting = false
         gate.reset()
@@ -243,7 +297,7 @@ class AudioPolicyEngine(private val app: Context) {
         }
     }
     private fun publish(snapshot: PolicySnapshot) {
-        lastRead = SystemClock.elapsedRealtime()
+        lastRead = elapsed()
         mutableState.update { it.copy(snapshot = if (manager.state.value.connected) snapshot else null) }
     }
     private fun operate(showBusy: Boolean = true, suspendAutomatic: Boolean = false, block: suspend () -> Unit): Job = scope.launch {
@@ -255,14 +309,17 @@ class AudioPolicyEngine(private val app: Context) {
                 report(e, suspendAutomatic)
                 if (manager.state.value.connected) {
                     try { publish(controller.read()) }
-                    catch (readError: Exception) { if (readError is CancellationException) throw readError }
+                    catch (readError: Exception) {
+                        if (readError is CancellationException) throw readError
+                        mutableState.update { it.copy(snapshot = null) }
+                    }
                 }
             } finally { if (showBusy) mutableState.update { it.copy(busy = false) } }
         }
     }
     private fun report(e: Exception, suspendAutomatic: Boolean) {
         Log.e(TAG, "Audio policy operation failed", e)
-        mutableState.update { it.copy(error = e.message ?: e.javaClass.simpleName,
+        mutableState.update { it.copy(snapshot = null, error = e.message ?: e.javaClass.simpleName,
             automaticSuspended = it.automaticSuspended || suspendAutomatic) }
     }
     companion object { private const val TAG = "AudioPolicyEngine" }

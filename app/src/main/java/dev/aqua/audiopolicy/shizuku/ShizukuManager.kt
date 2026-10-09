@@ -11,6 +11,7 @@ import android.util.Log
 import dev.aqua.audiopolicy.BuildConfig
 import dev.aqua.audiopolicy.aidl.IAudioPolicyService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
@@ -19,6 +20,7 @@ import rikka.shizuku.Shizuku
 data class ConnectionState(
     val installed: Boolean = false,
     val running: Boolean = false,
+    val ready: Boolean = false,
     val granted: Boolean = false,
     val connecting: Boolean = false,
     val connected: Boolean = false,
@@ -32,13 +34,21 @@ interface AudioPolicyPort {
 }
 
 /** Application-scoped; never holds an Activity. Lifecycle callbacks run on main. */
-class ShizukuManager(context: Context) : AudioPolicyPort {
+class ShizukuManager internal constructor(context: Context, private val access: ShizukuAccess,
+    private val callDispatcher: CoroutineDispatcher = Dispatchers.IO) : AudioPolicyPort {
+    constructor(context: Context) : this(context, RealShizukuAccess)
     private val app = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
     private val mutableState = MutableStateFlow(ConnectionState())
     val state = mutableState.asStateFlow()
     @Volatile private var service: IAudioPolicyService? = null
     private var closed = false
+    private var ready = false
+    private val retry = Runnable { refresh() }
+    private fun retryLater() {
+        handler.removeCallbacks(retry)
+        if (!closed) handler.postDelayed(retry, 5_000)
+    }
     private var bound = false
     private var linkedBinder: IBinder? = null
     private var recipient: IBinder.DeathRecipient? = null
@@ -50,12 +60,14 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
             detach()
             mutableState.value = mutableState.value.copy(connecting = false, connected = false,
                 error = "UserService 接続がタイムアウトしました。再読み込みしてください。")
+            retryLater()
         }
     }
     private var activeConnection: ServiceConnection? = null
     private fun newConnection() = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             if (closed || activeConnection !== this) return
+            if (linkedBinder === binder && service != null) return
             try {
                 clearService()
                 val death = IBinder.DeathRecipient {
@@ -66,6 +78,7 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
                 recipient = death
                 service = IAudioPolicyService.Stub.asInterface(binder)
                 handler.removeCallbacks(timeout)
+                handler.removeCallbacks(retry)
                 Log.i(TAG, "UserService connected")
                 mutableState.value = mutableState.value.copy(connecting = false, connected = true,
                     session = mutableState.value.session + 1, error = null)
@@ -82,13 +95,18 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
         }
     }
     private val received = Shizuku.OnBinderReceivedListener {
+        if (closed) return@OnBinderReceivedListener
+        ready = true
+        detach() // A replacement Shizuku Binder invalidates the old UserService session.
         Log.i(TAG, "Shizuku Binder received")
         refresh()
     }
     private val dead = Shizuku.OnBinderDeadListener {
+        if (closed) return@OnBinderDeadListener
+        ready = false
         Log.w(TAG, "Shizuku Binder died")
         disconnected("Shizuku が停止しました。起動後、再読み込みしてください。")
-        mutableState.value = mutableState.value.copy(running = false, granted = false)
+        mutableState.value = mutableState.value.copy(running = false, ready = false, granted = false)
     }
     private val permission = Shizuku.OnRequestPermissionResultListener { code, result ->
         if (code == REQUEST_CODE) {
@@ -100,9 +118,7 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
     }
 
     init {
-        Shizuku.addBinderDeadListener(dead)
-        Shizuku.addRequestPermissionResultListener(permission)
-        Shizuku.addBinderReceivedListenerSticky(received)
+        access.listen(received, dead, permission)
         refresh()
     }
 
@@ -114,24 +130,26 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
                 app.packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
                 true
             } catch (_: PackageManager.NameNotFoundException) { false }
-            val running = Shizuku.pingBinder()
-            val compatible = running && !Shizuku.isPreV11() && Shizuku.getVersion() >= 12
-            val granted = compatible && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-            Log.i(TAG, "Shizuku status: installed=$installed, running=$running, granted=$granted")
-            mutableState.value = mutableState.value.copy(installed = installed, running = running, granted = granted,
-                error = if (running && !compatible) "Shizuku v12 以降が必要です。" else null)
+            val running = access.ping()
+            val compatible = running && ready && access.compatible()
+            val granted = compatible && access.granted()
+            Log.i(TAG, "Shizuku status: installed=$installed, running=$running, ready=$ready, granted=$granted")
+            mutableState.value = mutableState.value.copy(installed = installed, running = running, ready = running && ready, granted = granted,
+                error = if (running && ready && !compatible) "Shizuku v12 以降が必要です。" else null)
             if (!granted) detach() else if (!bound) bind()
+            if (!running || !ready) retryLater()
         } catch (e: Exception) { fail(e) }
     }
 
     fun requestPermission() {
         try {
-            check(Shizuku.pingBinder()) { "Shizuku を先に起動してください。" }
-            check(!Shizuku.isPreV11() && Shizuku.getVersion() >= 12) { "Shizuku v12 以降が必要です。" }
-            if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) refresh()
-            else if (Shizuku.shouldShowRequestPermissionRationale()) {
+            check(access.ping()) { "Shizuku を先に起動してください。" }
+            check(ready) { "Shizuku の初期化を待っています。" }
+            check(access.compatible()) { "Shizuku v12 以降が必要です。" }
+            if (access.granted()) refresh()
+            else if (access.rationale()) {
                 mutableState.value = mutableState.value.copy(error = "Shizuku アプリの管理画面で、このアプリへの権限を許可してください。")
-            } else Shizuku.requestPermission(REQUEST_CODE)
+            } else access.request(REQUEST_CODE)
         } catch (e: Exception) { fail(e) }
     }
 
@@ -143,7 +161,7 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
         handler.postDelayed(timeout, 15_000)
         try {
             Log.i(TAG, "Binding UserService")
-            Shizuku.bindUserService(args, connection)
+            access.bind(args, connection)
         } catch (e: Exception) { fail(e) }
     }
 
@@ -152,6 +170,7 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
         detach()
         mutableState.value = mutableState.value.copy(connecting = false, connected = false, error = message)
         Log.w(TAG, message)
+        retryLater()
     }
     private fun clearService() {
         service = null
@@ -166,28 +185,35 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
         val connection = activeConnection
         activeConnection = null // Ignore delayed disconnect callbacks from an old binding.
         bound = false
-        if (wasBound && connection != null && Shizuku.pingBinder()) {
-            try { Shizuku.unbindUserService(args, connection, true) }
+        if (wasBound && connection != null) {
+            try { if (access.ping()) access.unbind(args, connection, true) }
             catch (e: Exception) { Log.w(TAG, "UserService unbind failed", e) }
+            // remove=true does not clear Shizuku-API's local connection list.
+            try { access.unbind(args, connection, false) }
+            catch (e: Exception) { Log.w(TAG, "UserService listener cleanup failed", e) }
         }
         mutableState.value = mutableState.value.copy(connecting = false, connected = false)
     }
     private fun fail(e: Exception) {
         Log.e(TAG, "Shizuku/Binder exception", e)
         disconnected(e.message ?: e.javaClass.simpleName)
+        val running = runCatching { access.ping() }.getOrDefault(false)
+        val granted = e !is SecurityException && running && ready && runCatching { access.granted() }.getOrDefault(false)
+        mutableState.value = mutableState.value.copy(running = running, ready = running && ready, granted = granted)
     }
 
-    private suspend fun <T> call(block: (IAudioPolicyService) -> T): T = withContext(Dispatchers.IO) {
+    private suspend fun <T> call(block: (IAudioPolicyService) -> T): T = withContext(callDispatcher) {
         val remote = service
         try {
-            check(Shizuku.pingBinder()) { "Shizuku が停止しています。" }
-            check(Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) { "Shizuku 権限がありません。" }
+            check(access.ping()) { "Shizuku が停止しています。" }
+            if (!access.granted()) throw SecurityException("Shizuku 権限がありません。")
             checkNotNull(remote) { "UserService 未接続です。" }
             check(remote.asBinder().isBinderAlive) { "UserService Binder が終了しています。" }
             block(remote)
         } catch (e: Exception) {
             Log.e(TAG, "Binder call failed", e)
-            if (e is android.os.DeadObjectException || e is SecurityException) {
+            if (generateSequence(e as Throwable) { it.cause }.any { it is android.os.RemoteException } || e is SecurityException ||
+                !runCatching { access.ping() }.getOrDefault(false) || remote?.asBinder()?.isBinderAlive != true) {
                 handler.post { if (service === remote) fail(e) }
             }
             throw e
@@ -199,9 +225,8 @@ class ShizukuManager(context: Context) : AudioPolicyPort {
 
     fun close() {
         closed = true
-        Shizuku.removeBinderReceivedListener(received)
-        Shizuku.removeBinderDeadListener(dead)
-        Shizuku.removeRequestPermissionResultListener(permission)
+        handler.removeCallbacks(retry)
+        access.stopListening(received, dead, permission)
         detach()
     }
     companion object { private const val TAG = "ShizukuManager"; private const val REQUEST_CODE = 100 }

@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
 private val Context.settingsStore by preferencesDataStore("audio_policy_restore")
@@ -20,18 +21,26 @@ data class RestoreRecord(
     val overrideActive: Boolean = false,
     val changePending: Boolean = false,
     val owner: OverrideOwner = OverrideOwner.MANUAL
-)
+) {
+    val hasRecovery get() = originalForceUse != null || overrideActive || changePending
+}
 
 interface RestoreStore {
     suspend fun read(): RestoreRecord
     suspend fun write(record: RestoreRecord)
 }
 
-class SettingsRepository(context: Context) : RestoreStore {
+interface PolicySettingsStore : RestoreStore {
+    val automation: Flow<AutomationSettings>
+    suspend fun setAutomationEnabled(enabled: Boolean)
+    suspend fun setTargets(packages: Set<String>)
+}
+
+class SettingsRepository(context: Context) : PolicySettingsStore {
     private val store = context.applicationContext.settingsStore
-    val automation = store.data.map { AutomationSettings(it[AUTO_ENABLED] ?: false, it[TARGETS] ?: emptySet()) }
-    suspend fun setAutomationEnabled(enabled: Boolean) { store.edit { it[AUTO_ENABLED] = enabled } }
-    suspend fun setTargets(packages: Set<String>) { store.edit { it[TARGETS] = packages.toSet() } }
+    override val automation = store.data.map { AutomationSettings(it[AUTO_ENABLED] ?: false, it[TARGETS] ?: emptySet()) }
+    override suspend fun setAutomationEnabled(enabled: Boolean) { store.edit { it[AUTO_ENABLED] = enabled } }
+    override suspend fun setTargets(packages: Set<String>) { store.edit { it[TARGETS] = packages.toSet() } }
     override suspend fun read(): RestoreRecord = store.data.first().let {
         RestoreRecord(it[ORIGINAL], it[ACTIVE] ?: false, it[PENDING] ?: false,
             if (it[OWNER] == OverrideOwner.AUTOMATIC.name) OverrideOwner.AUTOMATIC else OverrideOwner.MANUAL)

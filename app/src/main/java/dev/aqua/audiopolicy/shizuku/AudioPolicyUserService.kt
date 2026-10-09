@@ -35,13 +35,13 @@ class AudioPolicyUserService : IAudioPolicyService.Stub() {
         )
     }
 
-    override fun getForceUse(): Int = reflect {
+    @Synchronized override fun getForceUse(): Int = reflect {
         (methods.first.invoke(null, ForceUse.FOR_SYSTEM) as Int).also {
             Log.i(TAG, "getForceUse(4)=$it")
         }
     }
 
-    override fun setForceUse(config: Int): Int {
+    @Synchronized override fun setForceUse(config: Int): Int {
         validateConfig(config)
         return reflect {
             Log.i(TAG, "setForceUse(4, $config)")
