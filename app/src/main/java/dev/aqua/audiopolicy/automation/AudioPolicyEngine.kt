@@ -8,7 +8,6 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withTimeoutOrNull
 import android.os.PowerManager
 import android.app.NotificationManager
-import android.app.KeyguardManager
 import android.os.SystemClock
 import android.util.Log
 import android.os.Build
@@ -104,7 +103,6 @@ class AudioPolicyEngine internal constructor(private val app: Context,
     private var validatedSession = -1L
     private var lastRead = 0L
     private val power = app.getSystemService(PowerManager::class.java)
-    private val keyguard = app.getSystemService(KeyguardManager::class.java)
 
     init {
         scope.launch { diagnostics.load() }
@@ -443,7 +441,9 @@ class AudioPolicyEngine internal constructor(private val app: Context,
                             currentCoroutineContext().ensureActive()
                             if (generation == monitorGeneration && !automaticStopped && !state.value.automaticSuspended && manager.state.value.connected && restoreJob?.isActive != true) {
                                 val nowLocked = elapsed()
-                                val screenUnavailable = !power.isInteractive || keyguard.isKeyguardLocked
+                                // A secure camera can cover Keyguard without unlocking it. Only
+                                // screen-off may skip foreground observation; lock state cannot.
+                                val screenUnavailable = !power.isInteractive
                                 val verified = state.value.snapshot
                                 if (state.value.manualEnabled && verified?.warning == null) {
                                     screenIdle = false
@@ -509,7 +509,7 @@ class AudioPolicyEngine internal constructor(private val app: Context,
         }
     }
     private suspend fun observeTarget(): Boolean? {
-        if (!state.value.automation.enabled || !power.isInteractive || keyguard.isKeyguardLocked) {
+        if (!state.value.automation.enabled || !power.isInteractive) {
             mutableState.update { it.copy(foregroundPackage = null) }
             return false
         }

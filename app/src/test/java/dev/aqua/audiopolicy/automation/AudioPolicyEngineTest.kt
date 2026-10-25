@@ -132,10 +132,11 @@ class AudioPolicyEngineTest {
         assertEquals(listOf(0), f.remote.writes)
         f.manager.close()
     }
-    @Test fun lockAndScreenOffReleaseAutomaticButNeverManual() = runTest {
+    @Test fun lockedOutsideTargetAndScreenOffReleaseAutomaticButNeverManual() = runTest {
         val f = Fixture(this)
         start(f)
         shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        f.remote.top = "home"
         advanceTimeBy(1250); runCurrent()
         assertEquals(listOf(0, 11), f.remote.writes)
         f.engine.setManual(true); runCurrent()
@@ -667,15 +668,17 @@ class AudioPolicyEngineTest {
         assertTrue(f.store.record.changePending)
         f.manager.close()
     }
-    @Test fun lockRestoresOnceAndDuplicateWakeEventsDoNotApplyUntilUnlocked() = runTest {
+    @Test fun lockedNonTargetAndDuplicateWakeEventsDoNotApplyButCameraCan() = runTest {
         val f = Fixture(this); start(f)
         shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        f.remote.top = "home"
         advanceTimeBy(1750); runCurrent()
         assertEquals(listOf(0, 11), f.remote.writes)
-        val reads = f.remote.reads
         repeat(3) { f.context.sendBroadcast(Intent(Intent.ACTION_SCREEN_ON)) }
         shadowOf(Looper.getMainLooper()).idle(); runCurrent(); advanceTimeBy(5000); runCurrent()
-        assertEquals(reads, f.remote.reads)
+        assertEquals(listOf(0, 11), f.remote.writes)
+        f.remote.top = "camera.a"; advanceTimeBy(250); runCurrent()
+        assertEquals(listOf(0, 11, 0), f.remote.writes)
         shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(false)
         f.context.sendBroadcast(Intent(Intent.ACTION_USER_PRESENT)); shadowOf(Looper.getMainLooper()).idle(); runCurrent()
         assertEquals(listOf(0, 11, 0), f.remote.writes)
@@ -782,4 +785,85 @@ class AudioPolicyEngineTest {
         assertNull(f.engine.state.value.recoveryIssue)
         f.manager.close()
     }
+    @Test fun lockedCameraLaunchFromScreenOffIdleAppliesWithoutUnlock() = runTest {
+        val f = Fixture(this)
+        shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        shadowOf(f.context.getSystemService(PowerManager::class.java)).setIsInteractive(false)
+        f.remote.top = "home"; start(f)
+        advanceTimeBy(2000); runCurrent()
+        assertTrue(f.remote.writes.isEmpty())
+        val reads = f.remote.reads
+        advanceTimeBy(5000); runCurrent(); assertEquals(reads, f.remote.reads)
+        shadowOf(f.context.getSystemService(PowerManager::class.java)).setIsInteractive(true)
+        f.context.sendBroadcast(Intent(Intent.ACTION_SCREEN_ON))
+        shadowOf(Looper.getMainLooper()).idle(); runCurrent()
+        // The camera may start after SCREEN_ON, with no USER_PRESENT broadcast.
+        f.remote.top = "camera.a"; advanceTimeBy(250); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        assertEquals(11, f.store.record.originalForceUse)
+        assertEquals(OverrideOwner.AUTOMATIC, f.store.record.owner)
+        assertTrue(f.engine.state.value.automaticActive)
+        f.manager.close()
+    }
+    @Test fun lockedCameraKeepsOverrideAndUsesNormalExitDelay() = runTest {
+        val f = Fixture(this); start(f)
+        shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        advanceTimeBy(2000); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        f.remote.top = "camera.b"; advanceTimeBy(250); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        f.remote.top = "home"; advanceTimeBy(250); runCurrent()
+        advanceTimeBy(750); runCurrent(); assertEquals(listOf(0), f.remote.writes)
+        f.remote.top = "camera.a"; advanceTimeBy(250); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        f.remote.top = "home"; advanceTimeBy(1250); runCurrent()
+        assertEquals(listOf(0, 11), f.remote.writes)
+        assertEquals(RestoreRecord(), f.store.record)
+        f.manager.close()
+    }
+    @Test fun lockedUnknownForegroundNeverForcesRestore() = runTest {
+        val f = Fixture(this); start(f)
+        shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        f.remote.top = ""; advanceTimeBy(3000); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        assertEquals(11, f.store.record.originalForceUse)
+        f.remote.top = "camera.b"; advanceTimeBy(250); runCurrent()
+        assertTrue(f.engine.state.value.automaticActive)
+        f.manager.close()
+    }
+    @Test fun manualOffInLockedCameraHandsOffWithoutRestore() = runTest {
+        val f = Fixture(this); start(f)
+        f.engine.setManual(true); runCurrent()
+        shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        f.engine.setManual(false); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        assertEquals(OverrideOwner.AUTOMATIC, f.store.record.owner)
+        assertEquals(11, f.store.record.originalForceUse)
+        f.manager.close()
+    }
+
+    @Test fun lockedCameraScreenOffStillRestoresThenIdles() = runTest {
+        val f = Fixture(this)
+        shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        start(f); assertEquals(listOf(0), f.remote.writes)
+        shadowOf(f.context.getSystemService(PowerManager::class.java)).setIsInteractive(false)
+        advanceTimeBy(2500); runCurrent()
+        assertEquals(listOf(0, 11), f.remote.writes)
+        assertEquals(RestoreRecord(), f.store.record)
+        val reads = f.remote.reads; val foreground = f.remote.foregroundReads
+        advanceTimeBy(10000); runCurrent()
+        assertEquals(reads, f.remote.reads); assertEquals(foreground, f.remote.foregroundReads)
+        f.manager.close()
+    }
+    @Test fun lockedCameraReconnectPreservesOriginalWithoutRestoreReapply() = runTest {
+        val f = Fixture(this); start(f)
+        shadowOf(f.context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        f.disconnect(); runCurrent(); f.connect(); runCurrent()
+        advanceTimeBy(2000); runCurrent()
+        assertEquals(listOf(0), f.remote.writes)
+        assertEquals(11, f.store.record.originalForceUse)
+        assertTrue(f.engine.state.value.automaticActive)
+        f.manager.close()
+    }
+
 }
